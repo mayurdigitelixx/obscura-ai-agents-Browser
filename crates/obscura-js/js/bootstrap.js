@@ -8443,6 +8443,30 @@ function _arrayBufferFromBytes(bytes) {
   return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
 }
 
+async function _readStreamToBytes(stream) {
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const bytes = _bodyToUint8Array(value);
+      chunks.push(bytes);
+      total += bytes.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    out.set(chunks[i], offset);
+    offset += chunks[i].byteLength;
+  }
+  return out;
+}
+
 function _installWasmStreamingFallback() {
   if (typeof WebAssembly === 'undefined') return;
   if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
@@ -9128,7 +9152,8 @@ if (typeof Response === 'undefined') {
       } else if (this.status === 204 || this.status === 205 || this.status === 304) {
         body = null;
       }
-      this._bodyBytes = _bodyToUint8Array(body);
+      const isStream = body != null && typeof body === 'object' && typeof body.getReader === 'function';
+      this._bodyBytes = isStream ? new Uint8Array() : _bodyToUint8Array(body);
       this.ok = this.status >= 200 && this.status < 300;
       this.headers = new Headers(headers);
       this.type = internal ? (init.type || 'default') : 'default';
@@ -9140,7 +9165,9 @@ if (typeof Response === 'undefined') {
       this._bodyNull = body === null || body === undefined;
       this._bodyStream = null;
       this._bodyUsed = false;
-      this._fetchBody = null;
+      this._fetchBody = isStream
+        ? { promise: _readStreamToBytes(body), resource: { rid: null, consumers: 1 } }
+        : null;
       this._bodyAborted = false;
       this._bodyAbortReason = undefined;
     }
@@ -9165,7 +9192,7 @@ if (typeof Response === 'undefined') {
           },
           cancel: () => {
             this._bodyUsed = true;
-            if (this._fetchBody && --this._fetchBody.resource.consumers === 0) {
+            if (this._fetchBody && this._fetchBody.resource.rid != null && --this._fetchBody.resource.consumers === 0) {
               __obscuraCore.ops.op_try_close(this._fetchBody.resource.rid);
             }
           },
